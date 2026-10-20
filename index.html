@@ -2929,7 +2929,7 @@ function layout() {
    ONLINE: sala, sincronização e mensagens
    ===================================================================== */
 /* ---- transporte: um servidor público (MQTT) repassa as mensagens, então funciona em qualquer rede ---- */
-const RELAY_URLS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+const RELAY_URLS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
 const RELAY_ROOT = 'sinucabraba/v2/';
 class Emitter {
   constructor() { this._h = {}; }
@@ -2962,7 +2962,7 @@ class RelayPeer extends Emitter {
     try { c = mqtt.connect(urls[i], { clientId: 'sb_' + this.me, clean: true, connectTimeout: 7000, reconnectPeriod: 2000, keepalive: 30 }); }
     catch (e) { this._try(i + 1); return; }
     this.client = c;
-    const fail = setTimeout(() => { if (first) { first = false; try { c.end(true); } catch (e) { /* ok */ } this._try(i + 1); } }, 9000);
+    const fail = setTimeout(() => { if (first) { first = false; try { c.end(true); } catch (e) { /* ok */ } this._try(i + 1); } }, 7000);
     c.on('connect', () => {
       if (this.destroyed) return;
       if (first) { first = false; clearTimeout(fail); this._start(); return; }
