@@ -674,7 +674,7 @@ button { font: inherit; color: inherit; }
         </div>
       </div>
       <p class="on-status" id="on-status" aria-live="polite"></p>
-      <p class="hint">Versão de teste: os dois precisam estar com o jogo aberto ao mesmo tempo. Se não conectar no 4G, tentem os dois no Wi-Fi.</p>
+      <p class="hint">Versão de teste: os dois precisam estar com o jogo aberto ao mesmo tempo. Funciona de casas e redes diferentes, no Wi-Fi ou no 4G.</p>
     </div>
     <div class="on-lobby" id="on-lobby" hidden>
       <div class="box on-room">
@@ -723,7 +723,7 @@ button { font: inherit; color: inherit; }
 
 <div id="modal" class="modal" hidden><div class="modal-card" id="modal-card" role="dialog" aria-modal="true"></div></div>
 
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.14.1/dist/mqtt.min.js"></script>
 <script>
 (function () {
 'use strict';
@@ -2928,7 +2928,130 @@ function layout() {
 /* =====================================================================
    ONLINE: sala, sincronização e mensagens
    ===================================================================== */
-const PEER_PREFIX = 'sinucabraba-v1-';
+/* ---- transporte: um servidor público (MQTT) repassa as mensagens, então funciona em qualquer rede ---- */
+const RELAY_URLS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+const RELAY_ROOT = 'sinucabraba/v2/';
+class Emitter {
+  constructor() { this._h = {}; }
+  on(ev, fn) { (this._h[ev] = this._h[ev] || []).push(fn); return this; }
+  emit(ev, ...a) { (this._h[ev] || []).slice().forEach(fn => { try { fn(...a); } catch (e) { console.error(e); } }); }
+}
+const rid = () => Math.random().toString(36).slice(2, 10);
+class RelayConn extends Emitter {
+  constructor(peer, outTopic, from) { super(); this.peer = peer; this.out = outTopic; this.from = from; this.open = false; this.closed = false; this.seen = Date.now(); }
+  _open() { this.seen = Date.now(); if (this.open || this.closed) return; this.open = true; this.emit('open'); }
+  send(m) { if (this.open) this.peer._pub(this.out, { k: 'd', f: this.from, m }); }
+  close() { if (this.closed) return; if (this.open) this.peer._pub(this.out, { k: 'fin', f: this.from }); this._closed(); }
+  _closed() { if (this.closed) return; this.closed = true; this.open = false; this.emit('close'); }
+}
+// imita o pedaço do PeerJS que o jogo usa: anfitrião = new RelayPeer(código); convidado = new RelayPeer(null, código)
+class RelayPeer extends Emitter {
+  constructor(code, joinCode) {
+    super();
+    this.code = code || null; this.joinCode = joinCode || null; this.me = rid(); this.destroyed = false; this.ready = false;
+    this.conns = {}; this.hostConn = null; this.client = null;
+    this.hb = setInterval(() => this._beat(), 4000);
+    setTimeout(() => this._try(0), 0);
+  }
+  _urls() { return window.SINUCA_RELAY_URL ? [window.SINUCA_RELAY_URL] : RELAY_URLS; }
+  _try(i) {
+    if (this.destroyed) return;
+    const urls = this._urls();
+    if (i >= urls.length) { this.emit('error', { type: 'network' }); return; }
+    let c, first = true;
+    try { c = mqtt.connect(urls[i], { clientId: 'sb_' + this.me, clean: true, connectTimeout: 7000, reconnectPeriod: 2000, keepalive: 30 }); }
+    catch (e) { this._try(i + 1); return; }
+    this.client = c;
+    const fail = setTimeout(() => { if (first) { first = false; try { c.end(true); } catch (e) { /* ok */ } this._try(i + 1); } }, 9000);
+    c.on('connect', () => {
+      if (this.destroyed) return;
+      if (first) { first = false; clearTimeout(fail); this._start(); return; }
+      if (this.code) c.publish(RELAY_ROOT + this.code + '/room', '1', { qos: 1, retain: true });
+      if (this.hostConn && this.hostConn.open) this._pub(this.hostConn.out, { k: 'syn', f: this.me });
+      this.emit('reconnect');
+    });
+    c.on('message', (t, buf) => this._msg(t, buf));
+    c.on('error', () => { /* o cliente tenta de novo sozinho */ });
+  }
+  _start() {
+    const c = this.client;
+    if (this.code) {
+      const roomT = RELAY_ROOT + this.code + '/room';
+      this._checking = roomT; this._taken = false;
+      c.subscribe(roomT, { qos: 1 }, () => setTimeout(() => {
+        if (this.destroyed) return;
+        this._checking = null; c.unsubscribe(roomT);
+        if (this._taken) { this.emit('error', { type: 'unavailable-id' }); return; }
+        c.subscribe(RELAY_ROOT + this.code + '/h', { qos: 0 }, () => {
+          c.publish(roomT, '1', { qos: 1, retain: true });
+          this.ready = true; this.emit('open', this.code);
+        });
+      }, 900));
+    } else {
+      c.subscribe(RELAY_ROOT + 'g/' + this.me, { qos: 0 }, () => { this.ready = true; this.emit('open', this.me); });
+    }
+  }
+  connect(code) {
+    const conn = this.hostConn = new RelayConn(this, RELAY_ROOT + code + '/h', this.me);
+    let tries = 0;
+    const syn = () => {
+      if (this.destroyed || conn.open || conn.closed) return;
+      if (++tries > 12) { this.emit('error', { type: 'peer-unavailable' }); return; }
+      this._pub(conn.out, { k: 'syn', f: this.me });
+      this._synT = setTimeout(syn, 2000);
+    };
+    syn();
+    return conn;
+  }
+  _pub(topic, obj) { try { if (this.client && this.client.connected) this.client.publish(topic, JSON.stringify(obj), { qos: 0 }); } catch (e) { /* ok */ } }
+  _msg(t, buf) {
+    if (this.destroyed) return;
+    const txt = buf ? buf.toString() : '';
+    if (this._checking && t === this._checking) { if (txt.length) this._taken = true; return; }
+    let m; try { m = JSON.parse(txt); } catch (e) { return; }
+    if (!m || typeof m !== 'object') return;
+    if (this.code) {
+      const f = String(m.f || ''); if (!f) return;
+      let conn = this.conns[f];
+      if (m.k === 'syn') {
+        if (!conn || conn.closed) { conn = this.conns[f] = new RelayConn(this, RELAY_ROOT + 'g/' + f, this.code); this.emit('connection', conn); }
+        this._pub(conn.out, { k: 'ack', f: this.code });
+        conn._open(); return;
+      }
+      if (!conn) return;
+      conn.seen = Date.now();
+      if (m.k === 'd') conn.emit('data', m.m);
+      else if (m.k === 'fin') { delete this.conns[f]; conn._closed(); }
+    } else {
+      const conn = this.hostConn; if (!conn) return;
+      conn.seen = Date.now();
+      if (m.k === 'ack') { clearTimeout(this._synT); conn._open(); }
+      else if (m.k === 'd') conn.emit('data', m.m);
+      else if (m.k === 'fin') conn._closed();
+    }
+  }
+  _beat() {
+    if (this.destroyed || !this.client || !this.client.connected) return;
+    const now = Date.now();
+    const list = this.code ? Object.values(this.conns) : (this.hostConn ? [this.hostConn] : []);
+    for (const c of list) {
+      if (!c.open) continue;
+      if (now - c.seen > 30000) { c._closed(); continue; }
+      this._pub(c.out, { k: 'hb', f: c.from });
+    }
+  }
+  reconnect() { /* o cliente MQTT reconecta sozinho */ }
+  destroy() {
+    if (this.destroyed) return;
+    for (const c of Object.values(this.conns)) { if (c.open) this._pub(c.out, { k: 'fin', f: c.from }); }
+    if (this.hostConn && this.hostConn.open) this._pub(this.hostConn.out, { k: 'fin', f: this.me });
+    const c = this.client;
+    if (c && this.code && this.ready) { try { c.publish(RELAY_ROOT + this.code + '/room', '', { qos: 1, retain: true }); } catch (e) { /* ok */ } }
+    this.destroyed = true; clearInterval(this.hb); clearTimeout(this._synT);
+    setTimeout(() => { try { c && c.end(false); } catch (e) { /* ok */ } }, 300);
+  }
+}
+const PEER_PREFIX = '';
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const genCode = () => Array.from({ length: 4 }, () => CODE_CHARS[(Math.random() * CODE_CHARS.length) | 0]).join('');
 const cleanNick = v => String(v || '').toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^A-Z0-9 _-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 12);
@@ -2945,6 +3068,8 @@ function netSnap() {
       onOne: !!p.onOne, stats: p.stats, lastPower: p.lastPower })),
   };
 }
+// depois de uma queda rápida da internet: quem está jogando reenvia tudo, quem assiste pede
+function netResync() { if (!G || !G.net) return; if (myTurn()) netSendState(); else netSend({ t: 'resync' }); }
 function netSendState() {
   if (!G || !G.net || NET.replaying) return;
   // arredonda as posições paradas igual ao que vai pela rede, pros dois aparelhos ficarem idênticos
@@ -3016,6 +3141,7 @@ function onNetMsg(m) {
     case 'bye': { const c = NET.conn; NET.conn = null; try { c && c.close(); } catch (e) { /* ok */ } netLost('O seu amigo saiu da sala.'); return; }
     case 'start': if (!NET.isHost) netSilent(() => guestStart(m.s)); return;
     case 'rematch': if (NET.isHost && G && G.net && G.state === 'over') startNetMatch(); return;
+    case 'resync': if (G && G.net && myTurn()) netSendState(); return;
   }
   if (!G || !G.net) return;
   netSilent(() => {
@@ -3129,7 +3255,7 @@ function needNick() {
 }
 function peerReady() {
   if (/claude/i.test(location.hostname)) { onStatus('Dentro do Claude o modo online não funciona. Abra o jogo pelo link do GitHub (ou pelo Live Server) pra jogar com o seu amigo.'); return false; }
-  if (typeof Peer === 'function') return true;
+  if (window.mqtt && typeof window.mqtt.connect === 'function') return true;
   onStatus('O modo online não carregou. Abra o jogo pelo link do GitHub ou pelo Live Server, com internet.');
   return false;
 }
@@ -3139,7 +3265,8 @@ function netCreate(retry = 0) {
   NET.isHost = true; NET.code = genCode(); NET.castigo = PREFS.castigo; NET.myPick = PREFS.pick[0]; NET.opp = null;
   onStatus('Criando a sala...');
   let peer;
-  try { peer = NET.peer = new Peer(PEER_PREFIX + NET.code.toLowerCase(), peerOpts()); } catch (e) { netError({ type: 'browser-incompatible' }); return; }
+  try { peer = NET.peer = new RelayPeer(NET.code); } catch (e) { netError({ type: 'browser-incompatible' }); return; }
+  peer.on('reconnect', () => { if (NET.peer === peer) netResync(); });
   peer.on('open', () => { if (NET.peer === peer) showLobby(); });
   peer.on('connection', c => {
     if (NET.conn && NET.conn.open) { c.on('open', () => { c.send({ t: 'full' }); setTimeout(() => c.close(), 400); }); return; }
@@ -3161,13 +3288,14 @@ function netJoin() {
   NET.isHost = false; NET.code = code; NET.opp = null; NET.myPick = null;
   onStatus('Procurando a sala ' + code + '...');
   let peer;
-  try { peer = NET.peer = new Peer(undefined, peerOpts()); } catch (e) { netError({ type: 'browser-incompatible' }); return; }
+  try { peer = NET.peer = new RelayPeer(null, code); } catch (e) { netError({ type: 'browser-incompatible' }); return; }
+  peer.on('reconnect', () => { if (NET.peer === peer) netResync(); });
   peer.on('open', () => {
     if (NET.peer !== peer) return;
-    const c = peer.connect(PEER_PREFIX + code.toLowerCase(), { reliable: true, serialization: 'json' });
+    const c = peer.connect(code);
     NET.conn = c; bindConn(c);
     clearTimeout(NET.timer);
-    NET.timer = setTimeout(() => { if (NET.peer === peer && (!NET.conn || !NET.conn.open)) onStatus(`Não achei a sala ${code}. Confira o código e se o seu amigo está com a sala aberta.`); }, 15000);
+    NET.timer = setTimeout(() => { if (NET.peer === peer && (!NET.conn || !NET.conn.open)) onStatus(`Ainda procurando a sala ${code}... Confira o código e peça pro seu amigo deixar o jogo aberto na tela.`); }, 8000);
   });
   peer.on('error', e => { if (NET.peer === peer) netError(e); });
 }
